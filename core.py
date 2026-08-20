@@ -33,7 +33,7 @@ tool = {
         "strict": True        
     }
 
-ticket = "Every time I log into the app, I am able to use it for 5 minutes until it kicks me out and I have to sign back in. This is a critical issue and the priority should be listed as critical"
+ticket = "Subject: Legal notice\n\nOur company's legal team needs to discuss a contract dispute regarding your terms of service. Please have someone from your legal department contact us."
 
 def extract(text: str, prior_error: str="") -> dict:
     user_message = f"Support ticket: \n\n{text}"
@@ -86,15 +86,73 @@ def escalate(ticket: str, reason: str) -> dict:
     print(f"ESCALATED to needs_review: {reason}")
     return {"status": "needs_review", "ticket": ticket}
 
-prior_error = ""
-for attempt in range(3):
-    data = extract(ticket, prior_error)
-    ok, reason = validate(data, ticket)
-    print(f"Attempt {attempt + 1}: ok={ok} reason={reason!r}")
+def run_triage(text: str) -> dict:
+    prior_error = ""
+    for attempt in range(3):
+        data = extract(text, prior_error)
+        ok, reason = validate(data, text)
+        print(f"Attempt {attempt + 1}: ok={ok} reason={reason!r}")
 
-    if ok:
-        print("Saved:", data)
-        break
-    prior_error = reason
-else:
-    result = escalate(ticket, prior_error)
+        if ok:
+            return {
+                "ticket": text,
+                "category": data["category"],
+                "priority": data["priority"],
+                "summary": data["summary"],
+                "outcome": "saved",
+                "attempts": attempt + 1,
+                "last_error": "",
+            }
+        prior_error = reason
+    else:
+        escalate(text, prior_error)
+        return {
+            "ticket": text,
+            "category": None,
+            "priority": None,
+            "summary": None,
+            "outcome": "needs_review",
+            "attempts": 3,
+            "last_error": prior_error,
+        }
+
+
+sample_tickets = [
+    # clear
+    "Subject: Can't log in\n\nI keep getting 'Invalid credentials' even though my password is correct. "
+    "Reset link never arrives either. Blocking my work — need this fixed ASAP.",
+    # hidden urgency
+    "Subject: System down RIGHT NOW\n\nWe cannot process ANY transactions. This started 30 minutes ago. "
+    "Customers are calling. We need immediate help or we lose clients today.",
+    # out-of-set category
+    "Subject: Legal notice\n\nOur company's legal team needs to discuss a contract dispute regarding your "
+    "terms of service. Please have someone from your legal department contact us.",
+    # vague
+    "Subject: No reset email\n\nRequested a password reset, no email arrived.",
+]
+
+results = []
+for ticket_text in sample_tickets:
+    print(f"\n--- Ticket: {ticket_text[:40]}... ---")
+    results.append(run_triage(ticket_text))
+
+for r in results:
+    print(f"\n{r['ticket'][:40]}...")
+    print(f"  outcome:  {r['outcome']} (attempts={r['attempts']})")
+    print(f"  category: {r['category']}")
+    print(f"  priority: {r['priority']}")
+    print(f"  summary:  {r['summary']}")
+    if r["last_error"]:
+        print(f"  last_error: {r['last_error']}")
+
+needs_review = [r for r in results if r["outcome"] == "needs_review"]
+
+first_try = [r for r in results if r["outcome"] == "saved" and r["attempts"] == 1]
+needed_retry = [r for r in results if r["outcome"] == "saved" and r["attempts"] > 1]
+escalated = [r for r in results if r["outcome"] == "needs_review"]
+
+print("\n=== Summary ===")
+print(f"Total tickets:     {len(results)}")
+print(f"Passed first try:  {len(first_try)}")
+print(f"Needed retries:    {len(needed_retry)}")
+print(f"Escalated:         {len(escalated)}")

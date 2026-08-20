@@ -1,5 +1,6 @@
 import anthropic
 from dotenv import load_dotenv
+import time
 
 load_dotenv()
 client = anthropic.Anthropic()
@@ -36,20 +37,44 @@ tool = {
 }
 
 
-def extract(user_message: str) -> dict:
-    """Send one message to Claude and return the tool_use input dict."""
-    resp = client.messages.create(
-        model=MODEL,
-        max_tokens=200,
-        tools=[tool],
-        tool_choice={"type": "tool", "name": "save_triage"},
-        messages=[{"role": "user", "content": user_message}],
-    )
+TRANSIENT_STATUS_CODES = {429, 500, 503, 529}
+PERMANENT_STATUS_CODES = {400, 401, 403, 404}
+MAX_API_RETRIES = 4  # attempts 0-3 -> backoff of 1s, 2s, 4s, 8s between them
 
-    for block in resp.content:
-        if block.type == "tool_use":
-            return block.input
-    return {}
+
+def extract(user_message: str) -> dict:
+    """
+    Send one message to Claude and return the tool_use input dict.
+
+    Transient failures (rate limits, server hiccups: 429/500/503/529) are
+    retried with exponential backoff. Permanent failures (bad request, auth,
+    not found: 400/401/403/404) are raised immediately — retrying those can't
+    succeed, so it would just waste the retry budget.
+    """
+    for attempt in range(MAX_API_RETRIES):
+        try:
+            resp = client.messages.create(
+                model=MODEL,
+                max_tokens=200,
+                tools=[tool],
+                tool_choice={"type": "tool", "name": "save_triage"},
+                messages=[{"role": "user", "content": user_message}],
+            )
+        except anthropic.APIStatusError as e:
+            is_last_attempt = attempt == MAX_API_RETRIES - 1
+            if e.status_code in TRANSIENT_STATUS_CODES and not is_last_attempt:
+                wait = 2 ** attempt
+                print(f"Transient API error {e.status_code} (attempt {attempt + 1}/{MAX_API_RETRIES}); retrying in {wait}s")
+                time.sleep(wait)
+                continue
+            # Permanent error, an unlisted status code, or a transient error
+            # that never recovered — stop immediately, don't waste a retry.
+            raise
+
+        for block in resp.content:
+            if block.type == "tool_use":
+                return block.input
+        return {}
 
 
 def validate(data: dict, ticket: str) -> list[str]:
@@ -141,7 +166,24 @@ def run_triage(text: str) -> dict:
     errors: list[str] = []
 
     for attempt in range(1, MAX_RETRIES + 2):
-        data = extract(prompt)
+        try:
+            data = extract(prompt)
+        except anthropic.APIStatusError as e:
+            # extract() already exhausted its own retry budget (or hit a
+            # permanent error) — no point looping again with the same call.
+            api_error = f"API error {e.status_code}: {e.message}"
+            print(f"Attempt {attempt}: {api_error} -> escalating immediately")
+            escalate(text, [api_error])
+            return {
+                "ticket": text,
+                "category": None,
+                "priority": None,
+                "summary": None,
+                "outcome": "needs_review",
+                "attempts": attempt,
+                "last_error": api_error,
+            }
+
         errors = validate(data, text)
         errors += validate_semantics(text, data)
 
